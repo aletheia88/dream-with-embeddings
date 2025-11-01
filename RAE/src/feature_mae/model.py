@@ -17,7 +17,7 @@ class FeatureMaskedAutoencoder(nn.Module):
         self,
         *,
         feature_dim: int,
-        num_patches: int,
+        num_tokens: int,
         encoder_embed_dim: int = 768,
         encoder_depth: int = 12,
         encoder_num_heads: int = 12,
@@ -31,7 +31,7 @@ class FeatureMaskedAutoencoder(nn.Module):
     ) -> None:
         super().__init__()
         self.feature_dim = feature_dim
-        self.num_patches = num_patches
+        self.num_tokens = num_tokens
 
         if encoder_embed_dim != feature_dim:
             raise ValueError(
@@ -49,7 +49,7 @@ class FeatureMaskedAutoencoder(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_depth)
-        self.encoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, encoder_embed_dim))
+        self.encoder_pos_embed = nn.Parameter(torch.zeros(1, num_tokens + 1, encoder_embed_dim))
         self.encoder_cls_token = nn.Parameter(torch.zeros(1, 1, encoder_embed_dim))
         self.encoder_norm = norm_layer(encoder_embed_dim)
 
@@ -65,7 +65,7 @@ class FeatureMaskedAutoencoder(nn.Module):
         )
         self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=decoder_depth)
         self.decoder_embed = nn.Linear(encoder_embed_dim, decoder_embed_dim, bias=True)
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, decoder_embed_dim))
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_tokens + 1, decoder_embed_dim))
         self.decoder_cls_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         self.decoder_norm = norm_layer(decoder_embed_dim)

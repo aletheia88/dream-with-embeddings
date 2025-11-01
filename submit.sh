@@ -2,9 +2,9 @@
 #SBATCH --job-name=re
 #SBATCH --time=23:59:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --partition=ou_bcs_normal
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:h100:2
 #SBATCH --mem=120g
 #SBATCH --requeue
 #SBATCH --output=slurm-%j.out
@@ -19,15 +19,19 @@ source <("$MICROMAMBA_BIN" shell hook --shell=bash)
 
 
 cd /orcd/scratch/orcd/010/jianggy/smt/RAE
-PYTHONPATH=src micromamba run -n rae python -m feature_mae.train_feature_mae \
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+PYTHONPATH=src micromamba run -n rae torchrun --standalone --nproc_per_node=2 -m feature_mae.train_feature_mae \
     --data-path /orcd/scratch/bcs/002/jianggy/imagenet1k_wds \
-    --epochs 100 \
+    --epochs 800 \
     --steps-per-epoch 2503 \
+    --steps-are-global \
     --batch-size 512 \
-    --accumulation-steps 8 \
+    --accumulation-steps 4 \
     --mask-ratio 0.75 \
     --precision bf16 \
     --save-interval 20 \
     --num-workers 8 \
-    --output-dir results/feature_mae_vitb_accum \
-    --resume /orcd/scratch/orcd/010/jianggy/smt/RAE/results/feature_mae_vitb_accum/checkpoint_071.pth
+    --include-special \
+    --output-dir results/feature_mae_vitb_accum_alltokens

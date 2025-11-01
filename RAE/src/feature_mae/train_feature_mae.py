@@ -54,7 +54,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-config-path", type=str, default="configs/decoder/ViTXL")
     parser.add_argument("--decoder-weights", type=str, default="models/decoders/dinov2/wReg_base/ViTXL_n08/model.pt")
     parser.add_argument("--save-images", action="store_true", help="Enable saving reconstructions.")
-    parser.add_argument("--steps-per-epoch", type=int, default=None, help="Use when dataset is iterable (WebDataset).")
+    parser.add_argument("--include-special", action="store_true", help="Include CLS + register tokens as inputs/targets.")
+    parser.add_argument(
+        "--steps-per-epoch",
+        type=int,
+        default=None,
+        help="Number of micro-batches per epoch for iterable datasets (WebDataset).",
+    )
+    parser.add_argument(
+        "--steps-are-global",
+        action="store_true",
+        help="Interpret steps-per-epoch as global across all ranks; per-rank steps are computed as ceil(steps/world_size).",
+    )
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint path to resume training from.")
     parser.add_argument("--compile", dest="use_compile", action="store_true", help="(Deprecated) no-op flag retained for compatibility.")
     parser.add_argument("--no-compile", dest="use_compile", action="store_false")
@@ -94,15 +105,24 @@ def set_random_seed(seed: int, rank: int = 0) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def create_transform(image_size: int, mean: torch.Tensor, std: torch.Tensor) -> transforms.Compose:
-    return transforms.Compose(
-        [
-            transforms.RandomResizedCrop(image_size, scale=(0.2, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ]
-    )
+def create_transform(
+    image_size: int,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    *,
+    input_is_tensor: bool = False,
+) -> transforms.Compose:
+    ops = [
+        transforms.RandomResizedCrop(
+            image_size, scale=(0.2, 1.0), interpolation=transforms.InterpolationMode.BICUBIC
+        ),
+        transforms.RandomHorizontalFlip(),
+    ]
+    # When decoding to PIL, add ToTensor; for torchrgb, tensors are already float in [0,1]
+    if not input_is_tensor:
+        ops.append(transforms.ToTensor())
+    ops.append(transforms.Normalize(mean=mean, std=std))
+    return transforms.Compose(ops)
 
 
 def build_dataloader(
@@ -122,14 +142,24 @@ def build_dataloader(
                 shard_pattern,
                 repeat=True,
                 handler=wds.handlers.warn_and_continue,
-                shardshuffle=50,
+                shardshuffle=200,
+                # Explicitly split shards across distributed ranks
+                nodesplitter=getattr(wds, "split_by_node", None),
             )
-            .shuffle(2000)
-            .decode("pil")
+            # Larger sample-level shuffle buffer improves randomness for large batches
+            .shuffle(10000, initial=10000)
+            .decode("torchrgb")
             .to_tuple("jpg;jpeg;png", "cls")
             .map_tuple(transform, lambda x: x)
         )
-        loader = wds.WebLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+        loader = wds.WebLoader(
+            dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False,
+            prefetch_factor=4 if args.num_workers > 0 else None,
+        )
         if args.world_size > 1 and hasattr(loader, "ddp_equalize"):
             loader = loader.ddp_equalize(args.world_size)
         return loader, None
@@ -144,6 +174,8 @@ def build_dataloader(
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=True if args.num_workers > 0 else False,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
     return loader, sampler
 
@@ -199,6 +231,17 @@ def train_one_epoch(
     except TypeError:
         loader_length = None
     total_steps = args.steps_per_epoch if args.steps_per_epoch is not None else loader_length
+    # For iterable datasets (e.g., WebDataset), optionally treat steps_per_epoch as global
+    if loader_length is None and total_steps is not None and total_steps > 0:
+        if args.world_size > 1 and getattr(args, "steps_are_global", False):
+            import math as _math
+            per_rank = _math.ceil(total_steps / args.world_size)
+            if is_master(args):
+                print(
+                    f"Adjusting steps_per_epoch from global {total_steps} to per-rank {per_rank} for world_size={args.world_size}",
+                    flush=True,
+                )
+            total_steps = per_rank
     if total_steps is None or total_steps <= 0:
         raise ValueError("steps_per_epoch must be provided for iterable datasets.")
 
@@ -212,12 +255,14 @@ def train_one_epoch(
             break
         images = _extract_images(batch).to(device, non_blocking=True)
 
-        with torch.no_grad():
-            features = dino(images)
-            if normalizer is not None:
-                features = normalizer.normalize(features)
-
         autocast_ctx = autocast(**args.autocast_kwargs) if args.autocast_kwargs else nullcontext()
+        with torch.no_grad():
+            # Run DINO feature extraction in AMP as well for speed
+            with autocast_ctx:
+                features = dino(images)
+                if normalizer is not None:
+                    features = normalizer.normalize(features)
+
         with autocast_ctx:
             pred, target, mask = model(features, mask_ratio=args.mask_ratio)
             loss_fn = model.module.loss if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model.loss
@@ -265,8 +310,14 @@ def train_one_epoch(
                 if normalizer is not None:
                     recon_tokens = normalizer.denormalize(recon_tokens)
 
-                cls = torch.zeros(recon_tokens.size(0), 1, recon_tokens.size(-1), device=recon_tokens.device)
-                decoder_input = torch.cat([cls, recon_tokens], dim=1)
+                # For visualization, drop special tokens if present and only pass patch tokens
+                if args.include_special:
+                    start = dino.num_special_tokens
+                    recon_tokens_vis = recon_tokens[:, start:, :]
+                else:
+                    recon_tokens_vis = recon_tokens
+                cls = torch.zeros(recon_tokens_vis.size(0), 1, recon_tokens_vis.size(-1), device=recon_tokens_vis.device)
+                decoder_input = torch.cat([cls, recon_tokens_vis], dim=1)
                 logits = decoder(decoder_input, drop_cls_token=False).logits
                 pixels = decoder.unpatchify(logits)
                 save_path = Path(args.output_dir) / "samples" / f"epoch{epoch:03d}_step{step:06d}.png"
@@ -359,20 +410,25 @@ def main() -> None:
         processor = AutoImageProcessor.from_pretrained(args.dinov2_path)
     image_mean = torch.tensor(processor.image_mean, dtype=torch.float32, device=device).view(-1)
     image_std = torch.tensor(processor.image_std, dtype=torch.float32, device=device).view(-1)
-    transform = create_transform(args.image_size, image_mean.cpu(), image_std.cpu())
+    data_root = Path(args.data_path)
+    has_tars = any(data_root.rglob("*.tar"))
+    transform = create_transform(
+        args.image_size, image_mean.cpu(), image_std.cpu(), input_is_tensor=has_tars
+    )
 
     loader, sampler = build_dataloader(args, transform)
 
-    dino = Dinov2withNorm(dinov2_path=args.dinov2_path)
+    dino = Dinov2withNorm(dinov2_path=args.dinov2_path, include_special_tokens=args.include_special)
     dino.to(device)
     dino.eval()
     dino.requires_grad_(False)
     feature_dim = dino.hidden_size
     num_patches = (args.image_size // dino.patch_size) ** 2
+    num_tokens = num_patches + (dino.num_special_tokens if args.include_special else 0)
 
     model = FeatureMaskedAutoencoder(
         feature_dim=feature_dim,
-        num_patches=num_patches,
+        num_tokens=num_tokens,
         encoder_embed_dim=args.encoder_embed_dim,
         encoder_depth=args.encoder_depth,
         encoder_num_heads=args.encoder_heads,
@@ -417,7 +473,11 @@ def main() -> None:
             scaler.load_state_dict(scaler_state)
         resume_state = None
 
-    normalizer = FeatureNormalizer(args.feature_stat_path).to(device) if args.feature_stat_path else None
+    # FeatureNormalizer assumes a square grid (patch tokens only). Disable when special tokens are included.
+    if args.include_special:
+        normalizer = None
+    else:
+        normalizer = FeatureNormalizer(args.feature_stat_path).to(device) if args.feature_stat_path else None
 
     decoder = None
     if args.save_images:
