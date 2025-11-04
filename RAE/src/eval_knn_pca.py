@@ -1,15 +1,14 @@
 from pathlib import Path
 from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from typing import List, Optional, Tuple
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs
-from tqdm import tqdm
 import argparse
 import imagenet_loader
-import io
 import json
-import math
+import os
 import torch
 import torch.nn.functional as F
 
@@ -53,38 +52,6 @@ def extract_features(
     feats = torch.cat(feats, dim=0)
     labels = torch.cat(labels, dim=0)
     return feats, labels
-
-
-# @torch.no_grad()
-# def knn_classify(
-#     train_feats,
-#     train_labels,
-#     val_feats,
-#     val_labels,
-#     k: int,
-#     t: float,
-#     device: torch.device,
-# ) -> float:
-#     # Move memory bank to device
-#     mem_x = train_feats.to(device)
-#     mem_y = train_labels.to(device)
-#     correct = 0
-#     total = val_feats.size(0)
-#     bs = 2048 // max(1, (train_feats.size(1) // 256))  # heuristic for batch compute
-#     for i in range(0, total, bs):
-#         q = val_feats[i : i + bs].to(device)  # [B, C]
-#         sims = torch.mm(q, mem_x.t())  # [B, N]
-#         topk = sims.topk(k, dim=1)
-#         idx = topk.indices  # [B, k]
-#         sim = topk.values / t
-#         # gather labels and perform weighted voting
-#         votes = torch.zeros(q.size(0), 1000, device=device, dtype=sim.dtype)
-#         y_neighbors = mem_y[idx]
-#         votes.scatter_add_(1, y_neighbors, sim.exp())
-#         pred = votes.argmax(dim=1)
-#         correct += (pred == val_labels[i : i + bs].to(device)).sum().item()
-#     acc = correct / total * 100.0
-#     return acc
 
 
 @torch.no_grad()
@@ -157,39 +124,10 @@ def pca_compress(X: torch.Tensor, n_components: int):
     """
     pca = PCA(n_components=n_components, svd_solver="auto", whiten=False)
     Z = pca.fit_transform(X.numpy())
-    return Z
+    return torch.from_numpy(Z)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--ckpt", type=str, required=True)
-    parser.add_argument("--results-dir", type=str, default="results/eval")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--knn-k", type=int, default=20)
-    parser.add_argument("--knn-t", type=float, default=0.07)
-    parser.add_argument("--pca-n", type=int, default=512)
-    parser.add_argument(
-        "--max-train",
-        type=int,
-        default=None,
-        help="Optional cap on number of train samples for faster kNN.",
-    )
-    parser.add_argument(
-        "--max-val",
-        type=int,
-        default=None,
-        help="Optional cap on number of val samples for faster kNN.",
-    )
-    args = parser.parse_args()
-    # batch_size = 256
-    # num_workers = 1
-    # device = "cuda:0"
-    # k-NN params
-    # t = 0.07
-    # k = 20
+def main(args):
     data_root = Path("/home/alicialu/orcd/scratch/imagenet")
     paths = imagenet_loader.ImageNetPaths(
         train_dir=data_root / "train",  # contains 1000 *.tar shards
@@ -241,7 +179,8 @@ def main():
     print(f"pca features: {pca_train_feats.shape} {pca_valid_feats.shape}")
 
     print("K-NN clustering...")
-
+    os.makedirs(args.results_dir, exist_ok=True)
+    results = {}
     knn_accuracy = knn_classify(
         train_feats,
         train_labels,
@@ -252,7 +191,46 @@ def main():
         args.device,
     )
     print(f"knn accuracy: {knn_accuracy}")
+    results["knn_accuracy_full"] = knn_accuracy
+
+    knn_accuracy = knn_classify(
+        pca_train_feats,
+        train_labels,
+        pca_valid_feats,
+        valid_labels,
+        args.knn_k,
+        args.knn_t,
+        args.device,
+    )
+    results[f"knn_accuracy_pca_n{args.pca_n}"] = knn_accuracy
+
+    with open(Path(args.results_dir) / "eval_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print("Saved results to", Path(args.results_dir) / "eval_results.json")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--results-dir", type=str, default="results/eval")
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--knn-k", type=int, default=20)
+    parser.add_argument("--knn-t", type=float, default=0.07)
+    parser.add_argument("--pca-n", type=int, default=512)
+    parser.add_argument(
+        "--max-train",
+        type=int,
+        default=None,
+        help="Optional cap on number of train samples for faster kNN.",
+    )
+    parser.add_argument(
+        "--max-val",
+        type=int,
+        default=None,
+        help="Optional cap on number of val samples for faster kNN.",
+    )
+    args = parser.parse_args()
+    main(args)
