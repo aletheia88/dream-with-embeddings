@@ -5,6 +5,7 @@ from tqdm import tqdm
 from typing import List, Optional, Tuple, Union
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs
+from restore import fit_ridge_linear_map, linear_map_predict, evaluate_reconstruction
 import dataloader
 import numpy as np
 import random
@@ -45,6 +46,12 @@ class GlobalConfigs:
         ck = Path(self.ckpt)
         self.ckpt_path = ck if ck.is_absolute() else (self.model_root / ck)
         self.ckpt_path = self.ckpt_path.resolve()
+
+
+@dataclass
+class ReconstructParams:
+    lam: float
+    method: str
 
 
 def get_embeddings_n_labels(configs, corruption=False):
@@ -206,10 +213,10 @@ def reconstruct():
     # seeds = [1912, 1985, 1976, 2001, 2024]
     seed = 1912
     # schemes = ["baseline", "crop", "occlude", "gaussian"]
-    scheme = "gaussian"
+    scheme = "occlude"
     corrupt_range = (0.50, 0.70)
     k_neighbors = 25
-    noise_std = 0.01
+    noise_std = None
 
     seed_everything(seed)
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -226,9 +233,47 @@ def reconstruct():
         seed,
         generator,
     )
+    lam = 1
+    method = "ridge"
+    reconstruct_params = ReconstructParams(lam, method)
+
     clean_embeds_n_labels = get_embeddings_n_labels(configs)
     corrupt_embeds_n_labels = get_embeddings_n_labels(configs, corruption=True)
-    # TODO: train reconstruction model
+
+    clean_train_embeddings = clean_embeds_n_labels["embeddings"]["train"]
+    corrupt_train_embeddings = corrupt_embeds_n_labels["embeddings"]["train"]
+    clean_valid_embeddings = clean_embeds_n_labels["embeddings"]["valid"]
+    corrupt_valid_embeddings = corrupt_embeds_n_labels["embeddings"]["valid"]
+    train_labels = clean_embeds_n_labels["labels"]["train"]
+    valid_labels = clean_embeds_n_labels["labels"]["valid"]
+
+    if reconstruct_params.method == "ridge":
+        W, b = fit_ridge_linear_map(
+            X_train=corrupt_train_embeddings,
+            Y_train=clean_train_embeddings,
+            lam=reconstruct_params.lam,
+        )
+        train_embeds_pred = linear_map_predict(corrupt_train_embeddings, W, b)
+        valid_embeds_pred = linear_map_predict(corrupt_valid_embeddings, W, b)
+
+    # evaluation
+    train_metrics = evaluate_reconstruction(train_embeds_pred, clean_train_embeddings)
+    print("Train:", train_metrics)
+    # validation reconstruction (the real test)
+    valid_metrics = evaluate_reconstruction(valid_embeds_pred, clean_valid_embeddings)
+    print("Valid:", valid_metrics)
+
+    # see k-NN accuracy
+    valid_labels_pred = knn_predict(
+        train_embeds_pred,
+        train_labels,
+        valid_embeds_pred,
+        k=k_neighbors,
+        batch_size=batch_size,
+        device=device,
+    )
+    accuracy = (valid_labels_pred == valid_labels).float().mean().item()
+    print(f"{scheme} k-NN accuracy (k={k_neighbors}): {accuracy * 100:.2f}%")
 
 
 if __name__ == "__main__":
