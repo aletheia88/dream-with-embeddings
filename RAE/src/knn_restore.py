@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset, DataLoader
@@ -20,13 +20,14 @@ import torch.nn.functional as F
 
 
 def set_up():
-    config_file = "stage1/pretrained/DINOv2-B.yaml"
-    ckpt = "decoders/dinov2/wReg_base/ViTXL_n08/model.pt"
-    device = "cuda:0"
+    repo_root = Path(__file__).resolve().parents[1]
+    config_file = repo_root / "configs/stage1/pretrained/DINOv2-B.yaml"
+    ckpt = None  # optional stage-1 checkpoint (not required for encoding)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     batch_size = 64
     # seeds = [1912, 1985, 1976, 2001, 2024]
     seed = 1912
-    num_workers = 1
+    num_workers = 4
     # schemes = ["baseline", "crop", "occlude", "gaussian"]
     scheme = "occlude"
     corrupt_range = (0.50, 0.70)
@@ -37,17 +38,17 @@ def set_up():
     generator = torch.Generator(device=device).manual_seed(seed)
 
     global_configs = GlobalConfigs(
-        config_file,
-        ckpt,
-        batch_size,
-        k_neighbors,
-        scheme,
-        corrupt_range,
-        noise_std,
-        device,
-        seed,
-        num_workers,
-        generator,
+        config_file=str(config_file),
+        ckpt=None if ckpt is None else str(ckpt),
+        batch_size=batch_size,
+        k_neighbors=k_neighbors,
+        scheme=scheme,
+        corrupt_range=corrupt_range,
+        noise_std=noise_std,
+        device=device,
+        seed=seed,
+        num_workers=num_workers,
+        generator=generator,
     )
     lam = None  # lam = 1 for "ridge" regressor method
     method = "mlp"  # options: "ridge", "mlp"
@@ -72,7 +73,7 @@ def set_up():
 @dataclass
 class GlobalConfigs:
     config_file: str
-    ckpt: str
+    ckpt: Optional[str]
     batch_size: int
     k_neighbors: int
     scheme: str
@@ -82,11 +83,11 @@ class GlobalConfigs:
     seed: int
     num_workers: int
     generator: torch.Generator
-    config_root: Union[str, Path] = (
-        "/home/alicialu/orcd/scratch/large-embedding-models/RAE/configs"
+    config_root: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parents[1] / "configs"
     )
-    model_root: Union[str, Path] = (
-        "/home/alicialu/orcd/scratch/large-embedding-models/RAE/models"
+    model_root: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parents[1] / "models"
     )
 
     def __post_init__(self):
@@ -100,9 +101,12 @@ class GlobalConfigs:
         self.config_path = self.config_path.resolve()
 
         # model path: if relative, join to root; if absolute, keep as-is
-        ck = Path(self.ckpt)
-        self.ckpt_path = ck if ck.is_absolute() else (self.model_root / ck)
-        self.ckpt_path = self.ckpt_path.resolve()
+        if self.ckpt is not None:
+            ck = Path(self.ckpt)
+            self.ckpt_path = ck if ck.is_absolute() else (self.model_root / ck)
+            self.ckpt_path = self.ckpt_path.resolve()
+        else:
+            self.ckpt_path = None
 
 
 @dataclass
@@ -123,7 +127,10 @@ def get_embeddings_n_labels(configs, corruption=False):
         scheme = "baseline"
     # dataloader for images
     train_loader, valid_loader = dataloader.get_imagenette_loaders(
-        scheme, configs.corrupt_range, batch_size=configs.batch_size
+        scheme,
+        configs.corrupt_range,
+        batch_size=configs.batch_size,
+        num_workers=configs.num_workers,
     )
     rae = load_rae(configs.config_path, configs.ckpt_path, configs.device)
     train_embeddings, train_labels = extract_features(
@@ -150,20 +157,48 @@ def get_embeddings_n_labels(configs, corruption=False):
     }
 
 
-def load_rae(config_path: str, ckpt_path: str, device: torch.device):
+def load_rae(config_path: str, ckpt_path: Optional[str], device: torch.device):
     (stage1_cfg, *_rest) = parse_configs(config_path)
-    # Ensure DINOv3 encoder keeps its final norm affine params for eval
+    repo_root = Path(__file__).resolve().parents[1]
+
+    # Resolve local file references in the config if they exist; otherwise disable them.
+    def resolve_if_exists(path_str: Optional[str]) -> Optional[str]:
+        if path_str is None:
+            return None
+        candidate = Path(path_str)
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        return str(candidate) if candidate.exists() else None
+
     try:
         if stage1_cfg.params.encoder_cls in ("Dinov3withNorm", "Dinov3WithNorm"):
             stage1_cfg.params.encoder_params.normalize = False
     except Exception:
         pass
+
+    try:
+        dec_path = resolve_if_exists(stage1_cfg.params.get("pretrained_decoder_path"))
+        stage1_cfg.params.pretrained_decoder_path = dec_path
+    except Exception:
+        pass
+    try:
+        norm_path = resolve_if_exists(stage1_cfg.params.get("normalization_stat_path"))
+        stage1_cfg.params.normalization_stat_path = norm_path
+    except Exception:
+        pass
+
     rae = instantiate_from_config(stage1_cfg).to(device)
     rae.eval()
-    # load model weights
-    state = torch.load(ckpt_path, map_location="cpu")
-    rae.load_state_dict(state, strict=False)
-    rae.eval()
+
+    if ckpt_path is not None:
+        ckpt_file = Path(ckpt_path)
+        if not ckpt_file.is_absolute():
+            ckpt_file = repo_root / ckpt_file
+        if ckpt_file.exists():
+            state = torch.load(ckpt_file, map_location="cpu")
+            rae.load_state_dict(state, strict=False)
+        else:
+            print(f"[WARN] Stage-1 checkpoint not found at {ckpt_file}, skipping load.")
     return rae
 
 
