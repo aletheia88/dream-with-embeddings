@@ -266,12 +266,26 @@ Use the ADM evaluation suite to score generated samples:
 4. Evaluate:
 
    ```bash
-   python evaluator.py VIRTUAL_imagenet256_labeled.npz /path/to/samples.npz
-   ```
+  python evaluator.py VIRTUAL_imagenet256_labeled.npz /path/to/samples.npz
+  ```
 
 ## TorchXLA / TPU support
 
 See `XLA` branch for TPU support.
+
+## Fragment Retrieval Imagination
+
+We provide `src/retrieval_imagination.py` to study whether Stage-1 reconstructions (`x_hat`) recover semantics from heavy fragment corruptions (random crops/occlusions/gaussian noise). The script builds a clean training index, reconstructs corrupted validation images, retrieves the top-k nearest training samples for the fragment vs. the reconstruction, and reports precision@k.
+
+```bash
+micromamba run -n rae python src/retrieval_imagination.py \
+  --config configs/stage1/pretrained/DINOv2-B.yaml \
+  --scheme occlude --corrupt-range 0.5 0.7 \
+  --k 5 --max-queries 2048 \
+  --results-dir results/retrieval_imagination_occlude
+```
+
+The command writes a `metrics.json` summary plus `samples.json` containing visualization metadata + saved fragment/reconstruction PNGs. Open `notebooks/retrieval_imagination.ipynb` (point it at the results directory) to compare retrieval grids for fragments vs. reconstructions and qualitatively inspect the “imagination” behavior.
 
 
 
