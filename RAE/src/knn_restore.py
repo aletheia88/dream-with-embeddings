@@ -416,11 +416,9 @@ def train(
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
-            y_pred = model(xb)
-            # loss = MSE + cosine_weight * (1 - cosine_similiaty)
+            y_pred = F.normalize(model(xb), dim=-1)
             mse_loss = F.mse_loss(y_pred, yb)
-            cosine_loss = 1.0 - F.cosine_similarity(y_pred, yb, dim=-1, eps=1e-8).mean()
-            loss = mse_loss + cosine_weight * cosine_loss
+            loss = mse_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -435,13 +433,15 @@ def evaluate(model, train_loader, val_loader, device):
     yhat_train = []
     for xb, yb in train_loader:
         xb = xb.to(device)
-        yhat_train.append(model(xb).cpu())
+        preds = F.normalize(model(xb), dim=-1)
+        yhat_train.append(preds.cpu())
     train_pred = torch.cat(yhat_train, dim=0)
 
     yhat_val = []
     for xb, yb in val_loader:
         xb = xb.to(device)
-        yhat_val.append(model(xb).cpu())
+        preds = F.normalize(model(xb), dim=-1)
+        yhat_val.append(preds.cpu())
     val_pred = torch.cat(yhat_val, dim=0)
 
     return train_pred, val_pred

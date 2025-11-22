@@ -210,3 +210,4 @@ AGENTS*
 slurm*
 *.pt
 *.log
+.vscode/
