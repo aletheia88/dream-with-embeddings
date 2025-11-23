@@ -131,6 +131,7 @@ def get_embeddings_n_labels(configs, encoder_bundle, corruption=False):
         configs.corrupt_range,
         batch_size=configs.batch_size,
         num_workers=configs.num_workers,
+        shuffle=False,
     )
     train_embeddings, train_labels = extract_features(
         encoder_bundle,
@@ -302,7 +303,7 @@ def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfi
 
     if restore_configs.method == "mlp":
         # dataloader for image embeddings
-        train_loader, val_loader = create_dataloaders(
+        train_loader, train_eval_loader, val_loader = create_dataloaders(
             global_configs,
             restore_configs,
             clean_train_embeddings,
@@ -318,7 +319,7 @@ def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfi
         )
         model.eval()
         train_embeds_pred, valid_embeds_pred = evaluate(
-            model, train_loader, val_loader, global_configs.device
+            model, train_eval_loader, val_loader, global_configs.device
         )
         print(f"pred train embeds: {train_embeds_pred.shape}")
         print(f"pred valid embeds: {valid_embeds_pred.shape}")
@@ -359,10 +360,13 @@ def create_dataloaders(
     train_loader = DataLoader(
         train_ds, batch_size=global_configs.batch_size, shuffle=True, drop_last=False
     )
+    train_eval_loader = DataLoader(
+        train_ds, batch_size=global_configs.batch_size, shuffle=False, drop_last=False
+    )
     val_loader = DataLoader(
         val_ds, batch_size=global_configs.batch_size, shuffle=False, drop_last=False
     )
-    return train_loader, val_loader
+    return train_loader, train_eval_loader, val_loader
 
 
 def train(
@@ -441,11 +445,11 @@ def train(
     return model, losses
 
 
-def evaluate(model, train_loader, val_loader, device):
+def evaluate(model, train_eval_loader, val_loader, device):
     model.eval()
     yhat_train = []
     with torch.no_grad():
-        for xb, yb in train_loader:
+        for xb, yb in train_eval_loader:
             xb = xb.to(device)
             preds = F.normalize(model(xb), dim=-1)
             yhat_train.append(preds.cpu())

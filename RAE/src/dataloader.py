@@ -41,6 +41,7 @@ def get_imagenette_loaders(
     size: str = "320px",  # "full", "320px", or "160px"
     batch_size: int = 64,
     num_workers: int = 1,
+    shuffle: bool = True,
 ):
     if corrupt_range is None and scheme not in ["baseline", "gaussian"]:
         raise ValueError(f"`corrupt_range` must be provided for scheme='{scheme}'. ")
@@ -68,7 +69,7 @@ def get_imagenette_loaders(
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
     )
