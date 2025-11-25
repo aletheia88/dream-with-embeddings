@@ -8,7 +8,7 @@ import dataloader
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import StableUnCLIPPipeline
+from diffusers import StableUnCLIPImg2ImgPipeline
 from restore_methods import (
     ResidualMLP,
     evaluate_reconstruction,
@@ -81,11 +81,11 @@ def set_up():
 
     unclip_configs = UnCLIPConfigs(
         enabled=encoder_type == "clip",
-        model_id="stabilityai/stable-diffusion-2-1-unclip",
+        model_id="sd2-community/stable-diffusion-2-1-unclip-small",
         output_dir=os.path.join("results", "unclip_valid"),
         num_images=16,
         batch_size=4,
-        guidance_scale=7.5,
+        guidance_scale=5.0,
         num_inference_steps=30,
         torch_dtype="fp16" if "cuda" in device else "fp32",
         seed=seed,
@@ -593,7 +593,7 @@ def maybe_generate_images_with_unclip(
         f"Loading Stable unCLIP pipeline '{unclip_configs.model_id}' for decoding {num_to_generate} embeddings..."
     )
 
-    pipe = StableUnCLIPPipeline.from_pretrained(
+    pipe = StableUnCLIPImg2ImgPipeline.from_pretrained(
         unclip_configs.model_id,
         torch_dtype=target_dtype,
     )
@@ -613,8 +613,11 @@ def maybe_generate_images_with_unclip(
             generator = torch.Generator(device=torch_device)
             generator.manual_seed(unclip_configs.seed + start)
 
+        prompts = [""] * (end - start)
         outputs = pipe(
-            image_embeddings=batch,
+            image=None,
+            prompt=prompts,
+            image_embeds=batch,
             guidance_scale=unclip_configs.guidance_scale,
             num_inference_steps=unclip_configs.num_inference_steps,
             generator=generator,
