@@ -10,18 +10,14 @@ def preprocess(scheme: str, corrupt_range: tuple):
     mean = (0.485, 0.456, 0.406)
     std = (0.229, 0.224, 0.225)
 
-    standard_train_tfms = [
-        transforms.RandomResizedCrop(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ]
-    standard_valid_tfms = [
+    # Use deterministic resizing for both splits so corresponding clean/corrupt
+    # samples stay aligned across repeated feature extractions.
+    base_tfms = [
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean, std),
     ]
+    normalize = transforms.Normalize(mean, std)
     if scheme in ["baseline", "gaussian"]:
         corrupt_tfm = []
     elif scheme == "crop":
@@ -29,8 +25,8 @@ def preprocess(scheme: str, corrupt_range: tuple):
     elif scheme == "occlude":
         corrupt_tfm = [RandomSquareOccluder(area_frac_range=corrupt_range, fill=0.0)]
 
-    train_tfms = transforms.Compose(standard_train_tfms + corrupt_tfm)
-    valid_tfms = transforms.Compose(standard_valid_tfms + corrupt_tfm)
+    train_tfms = transforms.Compose(base_tfms + corrupt_tfm + [normalize])
+    valid_tfms = transforms.Compose(base_tfms + corrupt_tfm + [normalize])
 
     return train_tfms, valid_tfms
 
@@ -41,6 +37,7 @@ def get_imagenette_loaders(
     size: str = "320px",  # "full", "320px", or "160px"
     batch_size: int = 64,
     num_workers: int = 1,
+    shuffle: bool = True,
 ):
     if corrupt_range is None and scheme not in ["baseline", "gaussian"]:
         raise ValueError(f"`corrupt_range` must be provided for scheme='{scheme}'. ")
@@ -68,7 +65,7 @@ def get_imagenette_loaders(
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
     )

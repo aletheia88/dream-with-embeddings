@@ -1,32 +1,37 @@
+import math
+import os
+import random
 from dataclasses import dataclass
-from pathlib import Path
-from torch.utils.data import DataLoader
-from torch.utils.data import TensorDataset, DataLoader
-from tqdm import tqdm
-from typing import List, Optional, Tuple, Union
-from utils.model_utils import instantiate_from_config
-from utils.train_utils import parse_configs
-from restore_methods import (
-    fit_ridge_linear_map,
-    linear_map_predict,
-    evaluate_reconstruction,
-    ResidualMLP,
-)
+from typing import List, Optional, Tuple
+
 import dataloader
 import numpy as np
-import random
 import torch
 import torch.nn.functional as F
+from diffusers import StableUnCLIPImg2ImgPipeline
+from restore_methods import (
+    ResidualMLP,
+    HopfieldLayerDecoder,
+    evaluate_reconstruction,
+    fit_ridge_linear_map,
+    linear_map_predict,
+)
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+from transformers import AutoModel, CLIPImageProcessor, CLIPVisionModelWithProjection
+from torchvision.transforms.functional import to_pil_image
+
+
+IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
 
 
 def set_up():
-    config_file = "stage1/pretrained/DINOv2-B.yaml"
-    ckpt = "decoders/dinov2/wReg_base/ViTXL_n08/model.pt"
-    device = "cuda:0"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     batch_size = 64
     # seeds = [1912, 1985, 1976, 2001, 2024]
     seed = 1912
-    num_workers = 1
+    num_workers = 4
     # schemes = ["baseline", "crop", "occlude", "gaussian"]
     scheme = "occlude"
     corrupt_range = (0.50, 0.70)
@@ -37,42 +42,71 @@ def set_up():
     generator = torch.Generator(device=device).manual_seed(seed)
 
     global_configs = GlobalConfigs(
-        config_file,
-        ckpt,
-        batch_size,
-        k_neighbors,
-        scheme,
-        corrupt_range,
-        noise_std,
-        device,
-        seed,
-        num_workers,
-        generator,
+        batch_size=batch_size,
+        k_neighbors=k_neighbors,
+        scheme=scheme,
+        corrupt_range=corrupt_range,
+        noise_std=noise_std,
+        device=device,
+        seed=seed,
+        num_workers=num_workers,
+        generator=generator,
     )
     lam = None  # lam = 1 for "ridge" regressor method
-    method = "mlp"  # options: "ridge", "mlp"
-    hidden_dims = 128
+    method = "hopfield"  # options: "ridge", "mlp", "hopfield"
+    hidden_dims = 2048
     num_layers = 3
     dropout = 0.1
-    cosine_weight = 1
-    epochs = 1
+    epochs = 5
     restore_configs = ReconstructConfigs(
         method,
         lam,
         hidden_dims,
         num_layers,
         dropout,
-        cosine_weight,
         epochs,
     )
 
-    return global_configs, restore_configs
+    encoder_type = "clip"  # options: "dino", "clip"
+    if encoder_type == "clip":
+        encoder_model_name = "sd2-community/stable-diffusion-2-1-unclip-small"
+        model_subfolder = "image_encoder"
+        processor_subfolder = "feature_extractor"
+        normalize_features = False
+    else:
+        encoder_model_name = "facebook/dinov2-base"
+        model_subfolder = None
+        processor_subfolder = None
+        normalize_features = True
+
+    print("Building Encoder configs...")
+    encoder_configs = EncoderConfigs(
+        encoder_type=encoder_type,
+        model_name=encoder_model_name,
+        image_size=224,
+        model_subfolder=model_subfolder,
+        processor_subfolder=processor_subfolder,
+        normalize_features=normalize_features,
+    )
+
+    unclip_configs = UnCLIPConfigs(
+        enabled=encoder_type == "clip",
+        model_id="sd2-community/stable-diffusion-2-1-unclip-small",
+        output_dir=os.path.join("results", "unclip_valid"),
+        num_images=16,
+        batch_size=4,
+        guidance_scale=5.0,
+        num_inference_steps=30,
+        torch_dtype="fp16" if "cuda" in device else "fp32",
+        seed=seed,
+        enable_attention_slicing=True,
+    )
+
+    return global_configs, encoder_configs, restore_configs, unclip_configs
 
 
 @dataclass
 class GlobalConfigs:
-    config_file: str
-    ckpt: str
     batch_size: int
     k_neighbors: int
     scheme: str
@@ -82,27 +116,6 @@ class GlobalConfigs:
     seed: int
     num_workers: int
     generator: torch.Generator
-    config_root: Union[str, Path] = (
-        "/home/alicialu/orcd/scratch/large-embedding-models/RAE/configs"
-    )
-    model_root: Union[str, Path] = (
-        "/home/alicialu/orcd/scratch/large-embedding-models/RAE/models"
-    )
-
-    def __post_init__(self):
-        # normalize roots
-        self.config_root = Path(self.config_root).expanduser()
-        self.model_root = Path(self.model_root).expanduser()
-
-        # config path: if relative, join to root; if absolute, keep as-is
-        cf = Path(self.config_file)
-        self.config_path = cf if cf.is_absolute() else (self.config_root / cf)
-        self.config_path = self.config_path.resolve()
-
-        # model path: if relative, join to root; if absolute, keep as-is
-        ck = Path(self.ckpt)
-        self.ckpt_path = ck if ck.is_absolute() else (self.model_root / ck)
-        self.ckpt_path = self.ckpt_path.resolve()
 
 
 @dataclass
@@ -112,22 +125,48 @@ class ReconstructConfigs:
     hidden_dims: Optional[int]
     num_layers: Optional[int]
     dropout: Optional[float]
-    cosine_weight: float
     epochs: Optional[int]
 
 
-def get_embeddings_n_labels(configs, corruption=False):
+@dataclass
+class EncoderConfigs:
+    encoder_type: str  # "dino" or "clip"
+    model_name: str
+    image_size: int = 224
+    model_subfolder: Optional[str] = None
+    processor_subfolder: Optional[str] = None
+    normalize_features: bool = True
+
+
+@dataclass
+class UnCLIPConfigs:
+    enabled: bool
+    model_id: str
+    output_dir: str
+    num_images: int
+    batch_size: int
+    guidance_scale: float
+    num_inference_steps: int
+    torch_dtype: str = "fp16"
+    seed: Optional[int] = None
+    enable_attention_slicing: bool = True
+
+
+def get_embeddings_n_labels(configs, encoder_bundle, corruption=False):
     if corruption:
         scheme = configs.scheme
     else:
         scheme = "baseline"
     # dataloader for images
     train_loader, valid_loader = dataloader.get_imagenette_loaders(
-        scheme, configs.corrupt_range, batch_size=configs.batch_size
+        scheme,
+        configs.corrupt_range,
+        batch_size=configs.batch_size,
+        num_workers=configs.num_workers,
+        shuffle=False,
     )
-    rae = load_rae(configs.config_path, configs.ckpt_path, configs.device)
     train_embeddings, train_labels = extract_features(
-        rae,
+        encoder_bundle,
         train_loader,
         scheme,
         configs.device,
@@ -136,7 +175,7 @@ def get_embeddings_n_labels(configs, corruption=False):
         max_items=None,
     )
     valid_embeddings, valid_labels = extract_features(
-        rae,
+        encoder_bundle,
         valid_loader,
         scheme,
         configs.device,
@@ -150,26 +189,62 @@ def get_embeddings_n_labels(configs, corruption=False):
     }
 
 
-def load_rae(config_path: str, ckpt_path: str, device: torch.device):
-    (stage1_cfg, *_rest) = parse_configs(config_path)
-    # Ensure DINOv3 encoder keeps its final norm affine params for eval
-    try:
-        if stage1_cfg.params.encoder_cls in ("Dinov3withNorm", "Dinov3WithNorm"):
-            stage1_cfg.params.encoder_params.normalize = False
-    except Exception:
-        pass
-    rae = instantiate_from_config(stage1_cfg).to(device)
-    rae.eval()
-    # load model weights
-    state = torch.load(ckpt_path, map_location="cpu")
-    rae.load_state_dict(state, strict=False)
-    rae.eval()
-    return rae
+def load_encoder(encoder_configs: EncoderConfigs, device: torch.device):
+    encoder_type = encoder_configs.encoder_type.lower()
+    model_name = encoder_configs.model_name
+
+    if encoder_type == "dino":
+        model = AutoModel.from_pretrained(model_name)
+        feature_dim = getattr(model.config, "hidden_size", None)
+        processor = None
+    elif encoder_type == "clip":
+        model_kwargs = {}
+        if encoder_configs.model_subfolder:
+            model_kwargs["subfolder"] = encoder_configs.model_subfolder
+        model = CLIPVisionModelWithProjection.from_pretrained(
+            model_name, **model_kwargs
+        )
+
+        processor_kwargs = {}
+        if encoder_configs.processor_subfolder:
+            processor_kwargs["subfolder"] = encoder_configs.processor_subfolder
+        processor = CLIPImageProcessor.from_pretrained(model_name, **processor_kwargs)
+        feature_dim = getattr(model.config, "projection_dim", None)
+    else:
+        raise ValueError(f"Unsupported encoder_type='{encoder_configs.encoder_type}'")
+
+    if feature_dim is None:
+        raise ValueError(
+            f"Could not infer embedding dimension from model config for '{model_name}'."
+        )
+
+    model.to(device)
+    model.eval()
+
+    return {
+        "model": model,
+        "type": encoder_type,
+        "feature_dim": feature_dim,
+        "image_size": encoder_configs.image_size,
+        "processor": processor,
+        "normalize": encoder_configs.normalize_features,
+    }
+
+
+def prepare_unclip_pixel_values(
+    images: torch.Tensor, processor: CLIPImageProcessor
+) -> torch.Tensor:
+    mean = IMAGENET_MEAN.to(device=images.device, dtype=images.dtype)
+    std = IMAGENET_STD.to(device=images.device, dtype=images.dtype)
+    images = (images * std + mean).clamp(0.0, 1.0)
+    pil_batch = [to_pil_image(img.cpu()) for img in images]
+    pixel_values = processor(images=pil_batch, return_tensors="pt").pixel_values
+    return pixel_values.to(images.device)
 
 
 @torch.no_grad()
 def extract_features(
-    rae,
+    encoder_bundle,
     loader: DataLoader,
     scheme: str,
     device: torch.device,
@@ -180,23 +255,57 @@ def extract_features(
     if noise_std is None and scheme.lower() == "gaussian":
         raise ValueError(f"`noise_std` must be defined for the scheme {scheme}")
 
+    model = encoder_bundle["model"]
+    encoder_type = encoder_bundle["type"]
+    feature_dim = encoder_bundle["feature_dim"]
+    image_size = encoder_bundle.get("image_size", 224)
+    normalize_feats = encoder_bundle.get("normalize", True)
+    processor = encoder_bundle.get("processor")
+
     feats: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
     n_seen = 0
     for images, y in tqdm(loader):
         images = images.to(device, non_blocking=True)
 
-        z = rae.encode(images)  # (B, C, H, W)
-        z = z.mean(dim=(-2, -1))  # (B, C)
-        z = F.normalize(z, dim=-1)  # (B, C), unit norm
+        if encoder_type == "clip":
+            if processor is None:
+                raise ValueError("CLIP encoder requires an associated processor.")
+            pixel_values = prepare_unclip_pixel_values(images, processor)
+            outputs = model(pixel_values=pixel_values)
+            z = outputs.image_embeds
+        elif encoder_type == "dino":
+            pixel_values = images
+            outputs = model(pixel_values=pixel_values)
+            hidden = outputs.last_hidden_state  # (B, N+1, C)
+            hidden = hidden[:, 1:, :]  # drop CLS
+            b, n, c = hidden.shape
+            hw = int(math.sqrt(n))
+            if hw * hw != n:
+                raise ValueError(
+                    f"Unexpected token count {n}, cannot reshape to square."
+                )
+            z = hidden.transpose(1, 2).reshape(b, c, hw, hw)
+            z = z.mean(dim=(-2, -1))  # (B, C)
+        else:
+            raise ValueError(f"Unsupported encoder type: {encoder_type}")
+
+        if z.shape[-1] != feature_dim:
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {feature_dim}, got {z.shape[-1]}"
+            )
+
+        if normalize_feats:
+            z = F.normalize(z, dim=-1)
 
         if scheme.lower() == "gaussian" and noise_std > 0:
             eps = torch.randn(
                 z.shape, device=z.device, dtype=z.dtype, generator=generator
             )
             z = z + noise_std * eps
-            # renormalize after noise
-            z = F.normalize(z, dim=-1)
+            if normalize_feats:
+                # renormalize after noise
+                z = F.normalize(z, dim=-1)
 
         feats.append(z.cpu())
         labels.append(y.cpu())
@@ -268,9 +377,17 @@ def worker_init_fn(worker_id):
     random.seed(worker_seed)
 
 
-def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfigs):
-    clean_embeds_n_labels = get_embeddings_n_labels(global_configs)
-    corrupt_embeds_n_labels = get_embeddings_n_labels(global_configs, corruption=True)
+def reconstruct(
+    global_configs: GlobalConfigs,
+    encoder_configs: EncoderConfigs,
+    restore_configs: ReconstructConfigs,
+    unclip_configs: Optional[UnCLIPConfigs] = None,
+):
+    encoder_bundle = load_encoder(encoder_configs, global_configs.device)
+    clean_embeds_n_labels = get_embeddings_n_labels(global_configs, encoder_bundle)
+    corrupt_embeds_n_labels = get_embeddings_n_labels(
+        global_configs, encoder_bundle, corruption=True
+    )
 
     clean_train_embeddings = clean_embeds_n_labels["embeddings"]["train"]
     corrupt_train_embeddings = corrupt_embeds_n_labels["embeddings"]["train"]
@@ -288,9 +405,9 @@ def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfi
         train_embeds_pred = linear_map_predict(corrupt_train_embeddings, W, b)
         valid_embeds_pred = linear_map_predict(corrupt_valid_embeddings, W, b)
 
-    if restore_configs.method == "mlp":
+    if restore_configs.method in ["mlp", "hopfield"]:
         # dataloader for image embeddings
-        train_loader, val_loader = create_dataloaders(
+        train_loader, train_eval_loader, val_loader = create_dataloaders(
             global_configs,
             restore_configs,
             clean_train_embeddings,
@@ -298,15 +415,23 @@ def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfi
             clean_valid_embeddings,
             corrupt_valid_embeddings,
         )
+        feature_dim = encoder_bundle["feature_dim"]
+        normalize_outputs = encoder_bundle.get("normalize", True)
         model, losses = train(
             restore_configs,
             train_loader,
             val_loader,
             global_configs.device,
+            feature_dim,
+            normalize_outputs,
         )
         model.eval()
         train_embeds_pred, valid_embeds_pred = evaluate(
-            model, train_loader, val_loader, global_configs.device
+            model,
+            train_eval_loader,
+            val_loader,
+            global_configs.device,
+            normalize_outputs,
         )
         print(f"pred train embeds: {train_embeds_pred.shape}")
         print(f"pred valid embeds: {valid_embeds_pred.shape}")
@@ -332,6 +457,13 @@ def reconstruct(global_configs: GlobalConfigs, restore_configs: ReconstructConfi
         f"{global_configs.scheme} k-NN accuracy (k={global_configs.k_neighbors}): {accuracy * 100:.2f}%"
     )
 
+    if encoder_configs.encoder_type.lower() == "clip":
+        maybe_generate_images_with_unclip(
+            valid_embeds_pred,
+            unclip_configs,
+            global_configs.device,
+        )
+
 
 def create_dataloaders(
     global_configs,
@@ -347,10 +479,13 @@ def create_dataloaders(
     train_loader = DataLoader(
         train_ds, batch_size=global_configs.batch_size, shuffle=True, drop_last=False
     )
+    train_eval_loader = DataLoader(
+        train_ds, batch_size=global_configs.batch_size, shuffle=False, drop_last=False
+    )
     val_loader = DataLoader(
         val_ds, batch_size=global_configs.batch_size, shuffle=False, drop_last=False
     )
-    return train_loader, val_loader
+    return train_loader, train_eval_loader, val_loader
 
 
 def train(
@@ -358,63 +493,194 @@ def train(
     train_loader,
     val_loader,
     device,
+    feature_dim: int,
+    normalize_outputs: bool,
 ):
-    in_dim = 768
-    out_dim = 768
-    model = ResidualMLP(
-        in_dim,
-        restore_configs.hidden_dims,
-        out_dim,
-        num_layers=restore_configs.num_layers,
-        dropout=restore_configs.dropout,
-    ).to(device)
+    in_dim = feature_dim
+    out_dim = feature_dim
+
+    if restore_configs.method == "mlp":
+        model = ResidualMLP(
+            in_dim,
+            restore_configs.hidden_dims,
+            out_dim,
+            num_layers=restore_configs.num_layers,
+            dropout=restore_configs.dropout,
+        ).to(device)
+    if restore_configs.method == "hopfield":
+        model = HopfieldLayerDecoder(embeds_dim=in_dim).to(device)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=1e-3,
         weight_decay=1e-4,
     )
     num_epochs = restore_configs.epochs
-    cosine_weight = restore_configs.cosine_weight
-    # training loop
     losses = {"train": [], "val": []}
-    for epoch in tqdm(range(num_epochs)):
+    best_state = None
+    best_val = float("inf")
+    best_epoch = -1
+
+    for epoch in tqdm(range(num_epochs), desc="Training epochs"):
+        model.train()
+        running_loss = 0.0
+        n_samples = 0
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
             y_pred = model(xb)
-            # loss = MSE + cosine_weight * (1 - cosine_similiaty)
-            mse_loss = F.mse_loss(y_pred, yb)
-            cosine_loss = 1.0 - F.cosine_similarity(y_pred, yb, dim=-1, eps=1e-8).mean()
-            loss = mse_loss + cosine_weight * cosine_loss
+            if normalize_outputs:
+                y_pred = F.normalize(y_pred, dim=-1)
+            loss = F.mse_loss(y_pred, yb)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print(f"Epoch {epoch} loss: {loss.item()}")
-            losses["train"].append(loss.item())
+
+            running_loss += loss.item() * xb.size(0)
+            n_samples += xb.size(0)
+        epoch_train_loss = running_loss / max(n_samples, 1)
+        losses["train"].append(epoch_train_loss)
+
+        model.eval()
+        val_loss = 0.0
+        val_samples = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                preds = model(xb)
+                if normalize_outputs:
+                    preds = F.normalize(preds, dim=-1)
+                batch_loss = F.mse_loss(preds, yb)
+                val_loss += batch_loss.item() * xb.size(0)
+                val_samples += xb.size(0)
+        epoch_val_loss = val_loss / max(val_samples, 1)
+        losses["val"].append(epoch_val_loss)
+        print(
+            f"Epoch {epoch + 1}/{num_epochs} - train_loss: {epoch_train_loss:.6f} - val_loss: {epoch_val_loss:.6f}"
+        )
+
+        if epoch_val_loss < best_val:
+            best_val = epoch_val_loss
+            best_state = model.state_dict()
+            best_epoch = epoch
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    losses["best_epoch"] = best_epoch
+    losses["best_val_loss"] = best_val
 
     return model, losses
 
 
-def evaluate(model, train_loader, val_loader, device):
+def evaluate(model, train_eval_loader, val_loader, device, normalize_outputs: bool):
+    model.eval()
     yhat_train = []
-    for xb, yb in train_loader:
-        xb = xb.to(device)
-        yhat_train.append(model(xb).cpu())
+    with torch.no_grad():
+        for xb, yb in train_eval_loader:
+            xb = xb.to(device)
+            preds = model(xb)
+            if normalize_outputs:
+                preds = F.normalize(preds, dim=-1)
+            yhat_train.append(preds.cpu())
     train_pred = torch.cat(yhat_train, dim=0)
 
     yhat_val = []
-    for xb, yb in val_loader:
-        xb = xb.to(device)
-        yhat_val.append(model(xb).cpu())
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb = xb.to(device)
+            preds = model(xb)
+            if normalize_outputs:
+                preds = F.normalize(preds, dim=-1)
+            yhat_val.append(preds.cpu())
     val_pred = torch.cat(yhat_val, dim=0)
 
     return train_pred, val_pred
 
 
+def maybe_generate_images_with_unclip(
+    embeddings: torch.Tensor,
+    unclip_configs: Optional[UnCLIPConfigs],
+    device: torch.device,
+):
+    if unclip_configs is None or not unclip_configs.enabled:
+        return
+
+    torch_device = torch.device(device)
+
+    num_embeddings = embeddings.size(0)
+    if num_embeddings == 0:
+        print("No embeddings available for Stable unCLIP decoding.")
+        return
+
+    num_to_generate = min(unclip_configs.num_images, num_embeddings)
+    if num_to_generate <= 0:
+        print("Stable unCLIP generation skipped (num_images <= 0).")
+        return
+
+    dtype_map = {
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+    }
+    target_dtype = dtype_map.get(unclip_configs.torch_dtype.lower(), torch.float32)
+
+    os.makedirs(unclip_configs.output_dir, exist_ok=True)
+    print(
+        f"Loading Stable unCLIP pipeline '{unclip_configs.model_id}' for decoding {num_to_generate} embeddings..."
+    )
+
+    pipe = StableUnCLIPImg2ImgPipeline.from_pretrained(
+        unclip_configs.model_id,
+        torch_dtype=target_dtype,
+    )
+    pipe = pipe.to(torch_device)
+    pipe.set_progress_bar_config(disable=True)
+    if unclip_configs.enable_attention_slicing:
+        pipe.enable_attention_slicing()
+
+    selected = embeddings[:num_to_generate].to(device=torch_device, dtype=target_dtype)
+    batch_size = max(1, unclip_configs.batch_size)
+
+    for start in range(0, num_to_generate, batch_size):
+        end = min(start + batch_size, num_to_generate)
+        batch = selected[start:end]
+        generator = None
+        if unclip_configs.seed is not None:
+            generator = torch.Generator(device=torch_device)
+            generator.manual_seed(unclip_configs.seed + start)
+
+        prompts = [""] * (end - start)
+        outputs = pipe(
+            image=None,
+            prompt=prompts,
+            image_embeds=batch,
+            guidance_scale=unclip_configs.guidance_scale,
+            num_inference_steps=unclip_configs.num_inference_steps,
+            generator=generator,
+        )
+        for idx, pil_img in enumerate(outputs.images):
+            global_idx = start + idx
+            file_path = os.path.join(
+                unclip_configs.output_dir, f"valid_{global_idx:04d}.png"
+            )
+            pil_img.save(file_path)
+            print(f"Saved unCLIP image -> {file_path}")
+
+
 def main():
-    global_configs, restore_configs = set_up()
-    reconstruct(global_configs, restore_configs)
+    (
+        global_configs,
+        encoder_configs,
+        restore_configs,
+        unclip_configs,
+    ) = set_up()
+    reconstruct(global_configs, encoder_configs, restore_configs, unclip_configs)
 
 
 if __name__ == "__main__":

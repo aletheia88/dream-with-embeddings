@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+import hflayers as hf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,3 +113,51 @@ class ResidualMLP(nn.Module):
         x = self.ln_in(x)
         y = self.net(x)
         return y + self.proj(x0)  # residual skip
+
+
+class HopfieldLayerDecoder(nn.Module):
+    def __init__(
+        self,
+        embeds_dim: int = 768,
+        hidden_dim: int = 256,
+        quantity: int = 128,
+        beta: float = 1.0,
+    ):
+        super().__init__()
+        # project into Hopfield space
+        self.in_proj = nn.Sequential(
+            nn.LayerNorm(embeds_dim),
+            nn.Linear(embeds_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        # Hopfield layer lives inside `hidden_dim`
+        self.hopfield = hf.HopfieldLayer(
+            input_size=hidden_dim,  # state pattern R
+            hidden_size=hidden_dim,  # associative space W_Q, W_K
+            pattern_size=hidden_dim,  # pattern / output space W_V
+            quantity=quantity,  # number of memory slots
+            scaling=beta,
+            stored_pattern_as_static=True,
+            state_pattern_as_static=False,
+            pattern_projection_as_static=True,
+        )
+        # project back to embedding space
+        self.out_proj = nn.Sequential(
+            nn.Linear(hidden_dim, embeds_dim),
+            nn.LayerNorm(embeds_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # h: (B, embeds_dim)
+        h = self.in_proj(x)
+        # h_seq: (B, 1, hidden_dim)
+        # Hopfield layer expects a length-1 sequence
+        h_seq = h.unsqueeze(1)
+        # z: (B, 1, hidden_dim)
+        z = self.hopfield(h_seq)
+        # z: (B, hidden_dim)
+        z = z.squeeze(1)
+        # out: (B, embeds_dim)
+        out = self.out_proj(z)
+        out = out + x
+        return out
