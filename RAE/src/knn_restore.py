@@ -12,6 +12,7 @@ from diffusers import StableUnCLIPImg2ImgPipeline
 from restore_methods import (
     ResidualMLP,
     HopfieldLayerDecoder,
+    HopfieldAssociateDecoder,
     evaluate_reconstruction,
     fit_ridge_linear_map,
     linear_map_predict,
@@ -52,8 +53,10 @@ def set_up():
         num_workers=num_workers,
         generator=generator,
     )
-    lam = None  # lam = 1 for "ridge" regressor method
-    method = "hopfield"  # options: "ridge", "mlp", "hopfield"
+    # lam = 1 for "ridge" regressor method
+    lam = None
+    # options: "ridge", "mlp", "hopfield", "hopfield-associate"
+    method = "hopfield-associate"
     hidden_dims = 2048
     num_layers = 3
     dropout = 0.1
@@ -405,7 +408,7 @@ def reconstruct(
         train_embeds_pred = linear_map_predict(corrupt_train_embeddings, W, b)
         valid_embeds_pred = linear_map_predict(corrupt_valid_embeddings, W, b)
 
-    if restore_configs.method in ["mlp", "hopfield"]:
+    if restore_configs.method in ["mlp", "hopfield", "hopfield-associate"]:
         # dataloader for image embeddings
         train_loader, train_eval_loader, val_loader = create_dataloaders(
             global_configs,
@@ -432,6 +435,7 @@ def reconstruct(
             val_loader,
             global_configs.device,
             normalize_outputs,
+            restore_method=restore_configs.method,
         )
         print(f"pred train embeds: {train_embeds_pred.shape}")
         print(f"pred valid embeds: {valid_embeds_pred.shape}")
@@ -498,8 +502,9 @@ def train(
 ):
     in_dim = feature_dim
     out_dim = feature_dim
+    restore_method = restore_configs.method
 
-    if restore_configs.method == "mlp":
+    if restore_method == "mlp":
         model = ResidualMLP(
             in_dim,
             restore_configs.hidden_dims,
@@ -507,8 +512,11 @@ def train(
             num_layers=restore_configs.num_layers,
             dropout=restore_configs.dropout,
         ).to(device)
-    if restore_configs.method == "hopfield":
+    if restore_method == "hopfield":
         model = HopfieldLayerDecoder(embeds_dim=in_dim).to(device)
+
+    if restore_method == "hopfield-associate":
+        model = HopfieldAssociateDecoder(embeds_dim=in_dim).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -528,7 +536,12 @@ def train(
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
-            y_pred = model(xb)
+
+            if restore_method in ["mlp", "hopfield"]:
+                y_pred = model(xb)
+            if restore_method == "hopfield-associate":
+                y_pred = model(xb, yb)
+
             if normalize_outputs:
                 y_pred = F.normalize(y_pred, dim=-1)
             loss = F.mse_loss(y_pred, yb)
@@ -549,7 +562,12 @@ def train(
             for xb, yb in val_loader:
                 xb = xb.to(device)
                 yb = yb.to(device)
-                preds = model(xb)
+
+                if restore_method in ["mlp", "hopfield"]:
+                    preds = model(xb)
+                if restore_method == "hopfield-associate":
+                    preds = model(xb, yb)
+
                 if normalize_outputs:
                     preds = F.normalize(preds, dim=-1)
                 batch_loss = F.mse_loss(preds, yb)
@@ -575,13 +593,24 @@ def train(
     return model, losses
 
 
-def evaluate(model, train_eval_loader, val_loader, device, normalize_outputs: bool):
+def evaluate(
+    model,
+    train_eval_loader,
+    val_loader,
+    device,
+    normalize_outputs: bool,
+    restore_method: str,
+):
     model.eval()
     yhat_train = []
     with torch.no_grad():
         for xb, yb in train_eval_loader:
             xb = xb.to(device)
-            preds = model(xb)
+            if restore_method == "hopfield-associate":
+                yb = yb.to(device)
+                preds = model(xb, yb)
+            else:
+                preds = model(xb)
             if normalize_outputs:
                 preds = F.normalize(preds, dim=-1)
             yhat_train.append(preds.cpu())
@@ -591,7 +620,11 @@ def evaluate(model, train_eval_loader, val_loader, device, normalize_outputs: bo
     with torch.no_grad():
         for xb, yb in val_loader:
             xb = xb.to(device)
-            preds = model(xb)
+            if restore_method == "hopfield-associate":
+                yb = yb.to(device)
+                preds = model(xb, yb)
+            else:
+                preds = model(xb)
             if normalize_outputs:
                 preds = F.normalize(preds, dim=-1)
             yhat_val.append(preds.cpu())
@@ -644,7 +677,7 @@ def maybe_generate_images_with_unclip(
     if unclip_configs.enable_attention_slicing:
         pipe.enable_attention_slicing()
 
-    selected = embeddings[:num_to_generate].to(device=torch_device, dtype=target_dtype)
+    selected = embeddings[num_to_generate:].to(device=torch_device, dtype=target_dtype)
     batch_size = max(1, unclip_configs.batch_size)
 
     for start in range(0, num_to_generate, batch_size):
