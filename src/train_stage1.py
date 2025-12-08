@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import logging
 import math
 import os
 import random
@@ -46,6 +45,9 @@ from disc import (
 )
 from stage1 import RAE
 from utils import wandb_utils
+from utils.distributed import cleanup_distributed, init_distributed_mode, seed_everything
+from utils.ema import update_ema
+from utils.logging_utils import create_logger
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs
 from utils.optim_utils import build_optimizer, build_scheduler
@@ -62,52 +64,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path to resume training.")
     parser.add_argument('--wandb', action='store_true', help='Use Weights & Biases for logging if set.')
     return parser.parse_args()
-
-def create_logger(logging_dir):
-    """
-    Create a logger that writes to a log file and stdout.
-    """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-def setup_distributed() -> Tuple[int, int, torch.device]:
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        dist.init_process_group(backend="nccl")
-        local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
-    else:
-        rank = 0
-        world_size = 1
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return rank, world_size, device
-
-
-def cleanup_distributed():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-@torch.no_grad()
-def update_ema(ema_model: torch.nn.Module, current_model: torch.nn.Module, decay: float) -> None:
-    ema_params = dict(ema_model.named_parameters())
-    model_params = dict(current_model.named_parameters())
-    for name, param in model_params.items():
-        if name in ema_params:
-            ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
 
 def calculate_adaptive_weight(
     recon_loss: torch.Tensor,
@@ -319,7 +275,7 @@ def load_checkpoint(
 
 def main():
     args = parse_args()
-    rank, world_size, device = setup_distributed()
+    rank, world_size, device = init_distributed_mode(require_env=True)
     (rae_config, *_) = parse_configs(args.config)
     full_cfg = OmegaConf.load(args.config)
     training_section = full_cfg.get("training", None)
@@ -359,9 +315,7 @@ def main():
     num_epochs = int(training_cfg.get("epochs", 200))
     default_seed = int(training_cfg.get("global_seed", 0))
     global_seed = args.global_seed if args.global_seed is not None else default_seed
-    seed = global_seed * world_size + rank
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    seed = seed_everything(global_seed, world_size, rank)
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         experiment_index = len(glob(f"{args.results_dir}/*")) - 1
@@ -374,7 +328,7 @@ def main():
         experiment_dir = os.path.join(args.results_dir, experiment_name)
         checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank=rank)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.wandb:
             entity = os.environ["ENTITY"]
@@ -383,7 +337,7 @@ def main():
     else:
         experiment_dir = None
         checkpoint_dir = None
-        logger = create_logger(None)
+        logger = create_logger(None, rank=rank)
     
     rae: RAE = instantiate_from_config(rae_config).to(device)
     rae.encoder.eval()

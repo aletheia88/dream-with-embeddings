@@ -1,16 +1,24 @@
 from pathlib import Path
+from typing import List, Optional, Tuple
+
+import argparse
+import json
+
+import imagenet_loader
+import torch
+import torch.nn.functional as F
 from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import List, Optional, Tuple
+
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs
-import argparse
-import imagenet_loader
-import json
-import os
-import torch
-import torch.nn.functional as F
+
+
+def resolve_path(path_str: str, base_dir: Path) -> Path:
+    """Resolve absolute/relative paths against the repository root."""
+    path = Path(path_str)
+    return path if path.is_absolute() else base_dir / path
 
 
 def load_rae(config_path: str, ckpt_path: str, device: torch.device):
@@ -76,7 +84,6 @@ def knn_classify(
     val_labels = val_labels.to(device)
     print("train label range:", train_labels.min().item(), train_labels.max().item())
     print("val label range:", val_labels.min().item(), val_labels.max().item())
-    return
     total = val_feats.size(0)
     correct = 0
 
@@ -128,7 +135,8 @@ def pca_compress(X: torch.Tensor, n_components: int):
 
 
 def main(args):
-    data_root = Path("/home/alicialu/orcd/scratch/imagenet")
+    repo_root = Path(__file__).resolve().parents[1]
+    data_root = resolve_path(args.data_root, repo_root)
     paths = imagenet_loader.ImageNetPaths(
         train_dir=data_root / "train",  # contains 1000 *.tar shards
         val_tar=data_root / "ILSVRC2012_img_val.tar",
@@ -144,12 +152,8 @@ def main(args):
     )
     print("Done.")
 
-    config_root = "/home/alicialu/orcd/scratch/large-embedding-models/RAE/configs"
-    # config_path = f"{config_root}/stage1/pretrained/DINOv2-B.yaml"
-    config_path = f"{config_root}/{args.config}"
-    model_root = "/home/alicialu/orcd/scratch/large-embedding-models/RAE/models"
-    # ckpt_path = f"{model_root}/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"
-    ckpt_path = f"{model_root}/{args.ckpt}"
+    config_path = resolve_path(args.config, repo_root)
+    ckpt_path = resolve_path(args.ckpt, repo_root)
     print("Loading RAE...")
     rae = load_rae(config_path, ckpt_path, args.device)
     print("Done.")
@@ -204,9 +208,11 @@ def main(args):
     )
     results[f"knn_accuracy_pca_n{args.pca_n}"] = knn_accuracy
 
-    with open(Path(args.results_dir) / "eval_results.json", "w") as f:
+    results_dir = resolve_path(args.results_dir, repo_root)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    with open(results_dir / "eval_results.json", "w") as f:
         json.dump(results, f, indent=2)
-    print("Saved results to", Path(args.results_dir) / "eval_results.json")
+    print("Saved results to", results_dir / "eval_results.json")
 
 
 if __name__ == "__main__":
@@ -214,6 +220,12 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results/eval")
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        required=True,
+        help="Root directory containing ImageNet train/val/devkit files.",
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--device", type=str, default="cuda")

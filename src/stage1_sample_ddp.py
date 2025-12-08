@@ -22,33 +22,13 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
-import numpy as np
 
 from sample_ddp import create_npz_from_sample_folder
 from stage1 import RAE
+from utils.data_utils import center_crop_arr
+from utils.distributed import cleanup_distributed, init_distributed_mode, seed_everything
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import parse_configs
-
-
-def center_crop_arr(pil_image: Image.Image, image_size: int) -> Image.Image:
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
 class IndexedImageFolder(ImageFolder):
@@ -72,16 +52,8 @@ def main(args):
     torch.backends.cudnn.allow_tf32 = args.tf32
     torch.set_grad_enabled(False)
 
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    device_idx = rank % torch.cuda.device_count()
-    torch.cuda.set_device(device_idx)
-    device = torch.device("cuda", device_idx)
-
-    seed = args.global_seed * world_size + rank
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    rank, world_size, device = init_distributed_mode(require_env=True)
+    seed = seed_everything(args.global_seed, world_size, rank)
     if rank == 0:
         print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
@@ -163,7 +135,7 @@ def main(args):
         create_npz_from_sample_folder(sample_folder_dir, requested)
         print("Done.")
     dist.barrier()
-    dist.destroy_process_group()
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

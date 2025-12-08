@@ -5,6 +5,12 @@
 A minimal training script for SiT using PyTorch DDP.
 """
 import os
+import argparse
+import math
+from copy import deepcopy
+from glob import glob
+from time import time
+
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -15,96 +21,31 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
-import numpy as np
-from collections import OrderedDict
-from PIL import Image
-from copy import deepcopy
-from glob import glob
-from time import time
-import argparse
-import logging
-
-import math
 from torch.cuda.amp import autocast
 from omegaconf import OmegaConf
+
 from stage1 import RAE
 from stage2.models import Stage2ModelProtocol
-from stage2.transport import create_transport, Sampler
-from utils.train_utils import parse_configs
-from utils.model_utils import instantiate_from_config
+from stage2.transport import Sampler, create_transport
 from utils import wandb_utils
+from utils.data_utils import center_crop_arr
+from utils.distributed import cleanup_distributed, init_distributed_mode, seed_everything
+from utils.ema import update_ema
+from utils.logging_utils import create_logger
+from utils.model_utils import instantiate_from_config
 from utils.optim_utils import build_optimizer, build_scheduler
+from utils.train_utils import parse_configs
 
 
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
 
-@torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
-    """
-    Step the EMA model towards the current model.
-    """
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-
-    for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
 
 def requires_grad(model, flag=True):
-    """
-    Set requires_grad flag for all parameters in a model.
-    """
+    """Set requires_grad flag for all parameters in a model."""
     for p in model.parameters():
         p.requires_grad = flag
-
-
-def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
-
-
-def create_logger(logging_dir):
-    """
-    Create a logger that writes to a log file and stdout.
-    """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
 #################################################################################
@@ -166,18 +107,12 @@ def main(args):
     if args.image_size % 16 != 0:
         raise ValueError("Image size must be divisible by 16 for the RAE encoder.")
 
-    dist.init_process_group("nccl")
-    world_size = dist.get_world_size()
+    rank, world_size, device = init_distributed_mode(require_env=True)
     if global_batch_size % (world_size * grad_accum_steps) != 0:
         raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
-    rank = dist.get_rank()
-    device_idx = rank % torch.cuda.device_count()
-    torch.cuda.set_device(device_idx)
-    device = torch.device("cuda", device_idx)
+    device_idx = device.index if device.type == "cuda" else 0
 
-    seed = global_seed * world_size + rank
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    seed = seed_everything(global_seed, world_size, rank)
     if rank == 0:
         print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
@@ -225,7 +160,7 @@ def main(args):
         experiment_dir = os.path.join(args.results_dir, experiment_name)
         checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank=rank)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.wandb:
             entity = os.environ["ENTITY"]
@@ -234,7 +169,7 @@ def main(args):
     else:
         experiment_dir = None
         checkpoint_dir = None
-        logger = create_logger(None)
+        logger = create_logger(None, rank=rank)
 
     rae: RAE = instantiate_from_config(rae_config).to(device)
     rae.eval()
@@ -459,7 +394,7 @@ def main(args):
 
     model.eval()
     logger.info("Done!")
-    cleanup()
+    cleanup_distributed()
 
 
 

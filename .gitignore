@@ -211,3 +211,15 @@ slurm*
 *.pt
 *.log
 .vscode/
+
+# Project artifacts
+*.pth
+wandb/
+.cache/
+/samples/
+/results/
+/models/
+/checkpoints/
+pretrained_models/
+upload_to_hf.py
+.DS_Store

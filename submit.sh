@@ -18,9 +18,12 @@ fi
 source <("$MICROMAMBA_BIN" shell hook --shell=bash)
 
 
-cd /orcd/scratch/orcd/010/jianggy/smt/RAE
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "$0")" && pwd)}
+cd "$REPO_ROOT"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
+
+RESUME_PATH=${RESUME_PATH:-$REPO_ROOT/results/feature_mae_vitb_accum_alltokens/checkpoint_400.pth}
 
 PYTHONPATH=src micromamba run -n rae torchrun --standalone --nproc_per_node=2 -m feature_mae.train_feature_mae \
     --data-path /orcd/scratch/bcs/002/jianggy/imagenet1k_wds \
@@ -35,4 +38,4 @@ PYTHONPATH=src micromamba run -n rae torchrun --standalone --nproc_per_node=2 -m
     --num-workers 12 \
     --include-special \
     --output-dir results/feature_mae_vitb_accum_alltokens \
-    --resume /orcd/scratch/orcd/010/jianggy/smt/RAE/results/feature_mae_vitb_accum_alltokens/checkpoint_400.pth
+    --resume "$RESUME_PATH"

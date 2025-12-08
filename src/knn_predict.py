@@ -1,13 +1,16 @@
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+from pathlib import Path
 from typing import List, Optional, Tuple
-from utils.model_utils import instantiate_from_config
-from utils.train_utils import parse_configs
+
 import dataloader
 import numpy as np
 import random
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from utils.model_utils import instantiate_from_config
+from utils.train_utils import parse_configs
 
 
 def load_rae(config_path: str, ckpt_path: str, device: torch.device):
@@ -124,10 +127,10 @@ def worker_init_fn(worker_id):
 
 
 def main():
-    config_root = "/home/alicialu/orcd/scratch/large-embedding-models/RAE/configs"
-    config_path = f"{config_root}/stage1/pretrained/DINOv2-B.yaml"
-    model_root = "/home/alicialu/orcd/scratch/large-embedding-models/RAE/models"
-    ckpt_path = f"{model_root}/decoders/dinov2/wReg_base/ViTXL_n08/model.pt"
+    repo_root = Path(__file__).resolve().parents[1]
+    config_path = repo_root / "configs" / "stage1" / "pretrained" / "DINOv2-B.yaml"
+    model_root = repo_root / "models"
+    ckpt_path = model_root / "decoders" / "dinov2" / "wReg_base" / "ViTXL_n08" / "model.pt"
     device = "cuda:0"
 
     batch_size = 64

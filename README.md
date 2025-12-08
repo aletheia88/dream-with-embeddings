@@ -23,6 +23,15 @@ TorchXLA/TPU:
 * A TPU implementation of RAE and pretrained weights.
 * Sampling of RAE and DiT<sup>DH</sup> on TPU.
 
+## Repository Layout
+
+- `src/`: Python packages and training/sampling scripts.
+- `configs/`: OmegaConf configs for stage 1 and stage 2.
+- `assets/`: Example images for quick tests.
+- `notebooks/`: Analysis and visualization notebooks.
+- `results/`: Local artifacts (moved legacy contents to `results/rae/` during repo reorg).
+- `environment.yml`: Conda/micromamba environment specification.
+
 ## Environment
 
 ### Dependency Setup
@@ -49,7 +58,6 @@ We release three kind of models: RAE decoders, DiT<sup>DH</sup> diffusion transf
 
 ```bash
 
-cd RAE
 pip install huggingface_hub
 hf download nyu-visionx/RAE-collections \
   --local-dir models 
