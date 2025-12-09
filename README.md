@@ -1,4 +1,4 @@
-## Dream-Like Imagination with Large Embedding Models (LEMs)
+## MIT 9.520 Course Project: Dream-Like Imagination with Large Embedding Models (LEMs)
 
 We investigate whether large embedding models can “dream”: given heavily corrupted inputs, can they recover and recombine memories in embedding space and decode them back to coherent images?
 
